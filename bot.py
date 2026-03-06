@@ -324,7 +324,7 @@ def main():
     app.add_handler(CallbackQueryHandler(shop_callback, pattern="^buy_"))
 
     logger.info("🎣 Бот запущен!")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
