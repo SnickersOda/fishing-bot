@@ -593,7 +593,10 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.lower().strip()
     user = update.effective_user
+    has_reply = bool(update.message.reply_to_message)
+    logger.info(f"MSG: '{text}' | reply={has_reply} | user={user.first_name} | chat={update.effective_chat.type}")
     if any(t in text for t in STEAL_TRIGGERS):
+        logger.info(f"STEAL triggered by '{text}', has_reply={has_reply}")
         await do_steal(update, ctx)
         return
     for cmd, triggers in TEXT_TRIGGERS.items():
