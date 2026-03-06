@@ -7,8 +7,7 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, filters
 )
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,160 +51,139 @@ SHIELD_DURATION = timedelta(hours=12)
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 
 def get_db():
-    return psycopg2.connect(os.environ["DATABASE_URL"], cursor_factory=RealDictCursor)
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=psycopg.rows.dict_row)
 
 def init_db():
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id         BIGINT PRIMARY KEY,
-                    username        TEXT,
-                    total_kg        REAL    DEFAULT 0,
-                    fish_count      INTEGER DEFAULT 0,
-                    best_catch      REAL    DEFAULT 0,
-                    coins           INTEGER DEFAULT 0,
-                    rod             TEXT    DEFAULT 'rod_basic',
-                    bait            TEXT    DEFAULT NULL,
-                    last_fish       TEXT    DEFAULT NULL,
-                    last_steal      TEXT    DEFAULT NULL,
-                    shield_until    TEXT    DEFAULT NULL,
-                    extra_steals    INTEGER DEFAULT 0
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS catches (
-                    id         SERIAL PRIMARY KEY,
-                    user_id    BIGINT,
-                    fish_name  TEXT,
-                    weight     REAL,
-                    caught_at  TEXT
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS promocodes (
-                    code       TEXT PRIMARY KEY,
-                    coins      INTEGER NOT NULL,
-                    uses_left  INTEGER NOT NULL,
-                    created_at TEXT
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS promo_used (
-                    user_id BIGINT,
-                    code    TEXT,
-                    PRIMARY KEY (user_id, code)
-                )
-            """)
-            # Добавляем новые колонки если их нет (миграция)
-            for col, definition in [
-                ("last_steal",   "TEXT DEFAULT NULL"),
-                ("shield_until", "TEXT DEFAULT NULL"),
-                ("extra_steals", "INTEGER DEFAULT 0"),
-            ]:
-                try:
-                    cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}")
-                except Exception:
-                    pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id         BIGINT PRIMARY KEY,
+                username        TEXT,
+                total_kg        REAL    DEFAULT 0,
+                fish_count      INTEGER DEFAULT 0,
+                best_catch      REAL    DEFAULT 0,
+                coins           INTEGER DEFAULT 0,
+                rod             TEXT    DEFAULT 'rod_basic',
+                bait            TEXT    DEFAULT NULL,
+                last_fish       TEXT    DEFAULT NULL,
+                last_steal      TEXT    DEFAULT NULL,
+                shield_until    TEXT    DEFAULT NULL,
+                extra_steals    INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS catches (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT,
+                fish_name  TEXT,
+                weight     REAL,
+                caught_at  TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promocodes (
+                code       TEXT PRIMARY KEY,
+                coins      INTEGER NOT NULL,
+                uses_left  INTEGER NOT NULL,
+                created_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promo_used (
+                user_id BIGINT,
+                code    TEXT,
+                PRIMARY KEY (user_id, code)
+            )
+        """)
+        for col, definition in [
+            ("last_steal",   "TEXT DEFAULT NULL"),
+            ("shield_until", "TEXT DEFAULT NULL"),
+            ("extra_steals", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}")
+            except Exception:
+                conn.rollback()
         conn.commit()
 
 def get_user(user_id, username):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                cur.execute(
-                    "INSERT INTO users (user_id, username) VALUES (%s, %s)",
-                    (user_id, username)
-                )
+        row = conn.execute("SELECT * FROM users WHERE user_id=%s", (user_id,)).fetchone()
+        if not row:
+            conn.execute("INSERT INTO users (user_id, username) VALUES (%s, %s)", (user_id, username))
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE user_id=%s", (user_id,)).fetchone()
+        else:
+            if row["username"] != username:
+                conn.execute("UPDATE users SET username=%s WHERE user_id=%s", (username, user_id))
                 conn.commit()
-                cur.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
-                row = cur.fetchone()
-            else:
-                if row["username"] != username:
-                    cur.execute("UPDATE users SET username=%s WHERE user_id=%s", (username, user_id))
-                    conn.commit()
-                    row = dict(row)
-                    row["username"] = username
-            return dict(row)
+                row["username"] = username
+        return dict(row)
 
 def update_user(user_id, **kwargs):
     fields = ", ".join(f"{k}=%s" for k in kwargs)
     values = list(kwargs.values()) + [user_id]
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"UPDATE users SET {fields} WHERE user_id=%s", values)
+        conn.execute(f"UPDATE users SET {fields} WHERE user_id=%s", values)
         conn.commit()
 
 def add_catch(user_id, fish_name, weight):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO catches (user_id, fish_name, weight, caught_at) VALUES (%s,%s,%s,%s)",
-                (user_id, fish_name, weight, datetime.now().isoformat())
-            )
+        conn.execute(
+            "INSERT INTO catches (user_id, fish_name, weight, caught_at) VALUES (%s,%s,%s,%s)",
+            (user_id, fish_name, weight, datetime.now().isoformat())
+        )
         conn.commit()
 
 def get_top(limit=10):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT username, total_kg, fish_count, best_catch FROM users ORDER BY total_kg DESC LIMIT %s",
-                (limit,)
-            )
-            return cur.fetchall()
+        return conn.execute(
+            "SELECT username, total_kg, fish_count, best_catch FROM users ORDER BY total_kg DESC LIMIT %s",
+            (limit,)
+        ).fetchall()
 
 def get_stats(user_id):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT fish_name, COUNT(*) as cnt, SUM(weight) as total, MAX(weight) as best
-                   FROM catches WHERE user_id=%s GROUP BY fish_name ORDER BY total DESC""",
-                (user_id,)
-            )
-            return cur.fetchall()
+        return conn.execute(
+            """SELECT fish_name, COUNT(*) as cnt, SUM(weight) as total, MAX(weight) as best
+               FROM catches WHERE user_id=%s GROUP BY fish_name ORDER BY total DESC""",
+            (user_id,)
+        ).fetchall()
 
 # ─── PROMO ───────────────────────────────────────────────────────────────────
 
 def create_promo(code, coins, uses):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO promocodes (code, coins, uses_left, created_at) VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (code) DO UPDATE SET coins=%s, uses_left=%s""",
-                (code.upper(), coins, uses, datetime.now().isoformat(), coins, uses)
-            )
+        conn.execute(
+            """INSERT INTO promocodes (code, coins, uses_left, created_at) VALUES (%s,%s,%s,%s)
+               ON CONFLICT (code) DO UPDATE SET coins=%s, uses_left=%s""",
+            (code.upper(), coins, uses, datetime.now().isoformat(), coins, uses)
+        )
         conn.commit()
 
 def use_promo(user_id, code):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM promocodes WHERE code=%s", (code.upper(),))
-            promo = cur.fetchone()
-            if not promo:
-                return False, "❌ Промокод не найден!"
-            if promo["uses_left"] <= 0:
-                return False, "❌ Промокод уже полностью использован!"
-            cur.execute("SELECT 1 FROM promo_used WHERE user_id=%s AND code=%s", (user_id, code.upper()))
-            if cur.fetchone():
-                return False, "❌ Ты уже использовал этот промокод!"
-            cur.execute("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=%s", (code.upper(),))
-            cur.execute("INSERT INTO promo_used (user_id, code) VALUES (%s,%s)", (user_id, code.upper()))
+        promo = conn.execute("SELECT * FROM promocodes WHERE code=%s", (code.upper(),)).fetchone()
+        if not promo:
+            return False, "❌ Промокод не найден!"
+        if promo["uses_left"] <= 0:
+            return False, "❌ Промокод уже полностью использован!"
+        already = conn.execute("SELECT 1 FROM promo_used WHERE user_id=%s AND code=%s", (user_id, code.upper())).fetchone()
+        if already:
+            return False, "❌ Ты уже использовал этот промокод!"
+        conn.execute("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=%s", (code.upper(),))
+        conn.execute("INSERT INTO promo_used (user_id, code) VALUES (%s,%s)", (user_id, code.upper()))
         conn.commit()
         return True, promo["coins"]
 
 def list_promos():
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM promocodes ORDER BY created_at DESC")
-            return cur.fetchall()
+        return conn.execute("SELECT * FROM promocodes ORDER BY created_at DESC").fetchall()
 
 def delete_promo(code):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM promocodes WHERE code=%s", (code.upper(),))
-            cur.execute("DELETE FROM promo_used WHERE code=%s", (code.upper(),))
+        conn.execute("DELETE FROM promocodes WHERE code=%s", (code.upper(),))
+        conn.execute("DELETE FROM promo_used WHERE code=%s", (code.upper(),))
         conn.commit()
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
