@@ -1,8 +1,9 @@
 import logging
 import random
 import sqlite3
+import os
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, filters
@@ -12,6 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DB_PATH = "fishing.db"
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # твой Telegram ID
 
 FISH_TYPES = [
     ("🐟 Карась",   3,  6),
@@ -32,13 +34,16 @@ SHOP_ITEMS = [
 ]
 
 TEXT_TRIGGERS = {
-    "fish":    ["рыбалка", "рыбачить", "закинуть", "поймать рыбу", "рыбу"],
+    "fish":    ["рыбалка", "рыбачить", "закинуть", "поймать рыбу"],
     "profile": ["профиль", "мой профиль", "стата", "статус"],
     "top":     ["топ", "рейтинг", "лучшие рыбаки"],
     "stats":   ["статистика", "мой улов", "моя статистика"],
     "shop":    ["магазин", "купить", "снаряжение"],
     "help":    ["помощь", "команды"],
 }
+
+STEAL_TRIGGERS = ["спиздить", "украсть", "кража", "стырить", "свиснуть", "спереть"]
+MIN_COINS = 15
 
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 
@@ -69,6 +74,21 @@ def init_db():
                 fish_name   TEXT,
                 weight      REAL,
                 caught_at   TEXT
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS promocodes (
+                code        TEXT PRIMARY KEY,
+                coins       INTEGER NOT NULL,
+                uses_left   INTEGER NOT NULL,
+                created_at  TEXT
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS promo_used (
+                user_id     INTEGER,
+                code        TEXT,
+                PRIMARY KEY (user_id, code)
             )
         """)
         db.commit()
@@ -111,6 +131,49 @@ def get_stats(user_id):
                FROM catches WHERE user_id=? GROUP BY fish_name ORDER BY total DESC""",
             (user_id,)
         ).fetchall()
+
+# ─── PROMO DB ─────────────────────────────────────────────────────────────────
+
+def create_promo(code, coins, uses):
+    with get_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO promocodes (code, coins, uses_left, created_at) VALUES (?,?,?,?)",
+            (code.upper(), coins, uses, datetime.now().isoformat())
+        )
+        db.commit()
+
+def get_promo(code):
+    with get_db() as db:
+        row = db.execute("SELECT * FROM promocodes WHERE code=?", (code.upper(),)).fetchone()
+        return dict(row) if row else None
+
+def use_promo(user_id, code):
+    """Returns (success, message)"""
+    with get_db() as db:
+        promo = db.execute("SELECT * FROM promocodes WHERE code=?", (code.upper(),)).fetchone()
+        if not promo:
+            return False, "❌ Промокод не найден!"
+        if promo["uses_left"] <= 0:
+            return False, "❌ Промокод уже использован максимальное количество раз!"
+        already = db.execute(
+            "SELECT 1 FROM promo_used WHERE user_id=? AND code=?", (user_id, code.upper())
+        ).fetchone()
+        if already:
+            return False, "❌ Ты уже использовал этот промокод!"
+        db.execute("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=?", (code.upper(),))
+        db.execute("INSERT INTO promo_used (user_id, code) VALUES (?,?)", (user_id, code.upper()))
+        db.commit()
+        return True, promo["coins"]
+
+def list_promos():
+    with get_db() as db:
+        return db.execute("SELECT * FROM promocodes ORDER BY created_at DESC").fetchall()
+
+def delete_promo(code):
+    with get_db() as db:
+        db.execute("DELETE FROM promocodes WHERE code=?", (code.upper(),))
+        db.execute("DELETE FROM promo_used WHERE code=?", (code.upper(),))
+        db.commit()
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -230,13 +293,234 @@ async def do_shop(user, reply_fn):
 async def do_help(reply_fn):
     await reply_fn(
         "💡 *Все команды:*\n\n"
-        "🎣 /fish или напиши *рыбалка*\n"
-        "👤 /profile или *профиль*\n"
-        "🏆 /top или *топ*\n"
-        "📊 /stats или *статистика*\n"
-        "🛒 /shop или *магазин*\n"
-        "❓ /help или *помощь*\n\n"
-        "_Лови рыбу, зарабатывай монеты и покупай лучшее снаряжение!_",
+        "🎣 /fish — Закинуть удочку (1 раз в час)\n"
+        "👤 /profile — Твой профиль\n"
+        "🏆 /top — Топ рыбаков\n"
+        "📊 /stats — Статистика улова\n"
+        "🛒 /shop — Магазин снаряжения\n"
+        "🎁 /promo [код] — Активировать промокод\n"
+        "🦹 Ответь *спиздить* на чьё-то сообщение — украсть монеты\n\n"
+        "_Лови рыбу, зарабатывай монеты, грабь соседей!_",
+        parse_mode="Markdown"
+    )
+
+# ─── STEAL LOGIC ─────────────────────────────────────────────────────────────
+
+async def do_steal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    thief = update.effective_user
+
+    if not msg.reply_to_message:
+        await msg.reply_text(
+            "🕵️ Чтобы украсть — *ответь* на сообщение жертвы и напиши *спиздить*",
+            parse_mode="Markdown"
+        )
+        return
+
+    victim = msg.reply_to_message.from_user
+
+    if victim.id == thief.id:
+        await msg.reply_text("🤡 Сам у себя красть? Ну ты даёшь...")
+        return
+
+    if victim.is_bot:
+        await msg.reply_text("🤖 У бота нечего красть — он не рыбачит!")
+        return
+
+    t = get_user(thief.id, thief.first_name)
+    v = get_user(victim.id, victim.first_name)
+
+    if t["coins"] < MIN_COINS:
+        await msg.reply_text(
+            f"😅 *{thief.first_name}*, у тебя меньше {MIN_COINS}💰 —\n"
+            f"нищий у нищего не крадёт!",
+            parse_mode="Markdown"
+        )
+        return
+
+    if v["coins"] < MIN_COINS:
+        await msg.reply_text(
+            f"😬 У *{victim.first_name}* всего {v['coins']}💰 —\n"
+            f"грабить нищих последнее дело!",
+            parse_mode="Markdown"
+        )
+        return
+
+    success = random.random() < 0.5
+
+    if success:
+        percent = random.uniform(0.05, 0.40)
+        stolen = max(1, int(v["coins"] * percent))
+        update_user(thief.id, coins=t["coins"] + stolen)
+        update_user(victim.id, coins=v["coins"] - stolen)
+
+        outcomes = [
+            f"😈 *{thief.first_name}* мастерски обчистил карманы *{victim.first_name}*!\n\n"
+            f"💸 Украдено: *{stolen}💰*\n"
+            f"👛 Теперь у тебя: *{t['coins'] + stolen}💰*",
+
+            f"🕵️ Операция прошла успешно!\n\n"
+            f"*{thief.first_name}* увёл *{stolen}💰* у *{victim.first_name}* — "
+            f"тот даже не заметил!",
+
+            f"🐟 Пока *{victim.first_name}* глядел на поплавок,\n"
+            f"*{thief.first_name}* стащил *{stolen}💰* из его кармана! 😏",
+        ]
+        await msg.reply_text(random.choice(outcomes), parse_mode="Markdown")
+
+    else:
+        fine = random.randint(1, min(20, t["coins"]))
+        update_user(thief.id, coins=t["coins"] - fine)
+
+        fails = [
+            f"🚨 *{thief.first_name}* попался на горячем!\n\n"
+            f"*{victim.first_name}* заметил кражу и вызвал рыбнадзор.\n"
+            f"Штраф: *{fine}💰* 😤",
+
+            f"👮 Неудача! *{thief.first_name}* поскользнулся на рыбьей чешуе\n"
+            f"и привлёк внимание всей группы. Штраф: *{fine}💰*",
+
+            f"😂 *{thief.first_name}* попытался обокрасть *{victim.first_name}*,\n"
+            f"но был пойман за руку! Штраф: *{fine}💰* 🤦",
+        ]
+        await msg.reply_text(random.choice(fails), parse_mode="Markdown")
+
+# ─── PROMO LOGIC ─────────────────────────────────────────────────────────────
+
+async def promo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = ctx.args
+
+    if not args:
+        await update.message.reply_text(
+            "🎁 Введи промокод: `/promo КОД`",
+            parse_mode="Markdown"
+        )
+        return
+
+    code = args[0].strip()
+    ok, result = use_promo(user.id, code)
+
+    if not ok:
+        await update.message.reply_text(result)
+        return
+
+    coins = result
+    u = get_user(user.id, user.first_name)
+    update_user(user.id, coins=u["coins"] + coins)
+
+    await update.message.reply_text(
+        f"🎉 Промокод *{code.upper()}* активирован!\n\n"
+        f"💰 Начислено: *+{coins} монет*\n"
+        f"👛 Твой баланс: *{u['coins'] + coins}💰*",
+        parse_mode="Markdown"
+    )
+
+# ─── ADMIN PROMO PANEL ───────────────────────────────────────────────────────
+
+async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать промокод", callback_data="adm_create")],
+        [InlineKeyboardButton("📋 Список промокодов", callback_data="adm_list")],
+    ])
+    await update.message.reply_text(
+        "🔧 *Панель администратора*\n\nУправление промокодами:",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    if user.id != ADMIN_ID:
+        await query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+
+    await query.answer()
+    data = query.data
+
+    if data == "adm_create":
+        await query.message.reply_text(
+            "📝 Отправь команду в формате:\n\n"
+            "`/newpromo КОД МОНЕТЫ АКТИВАЦИЙ`\n\n"
+            "Пример: `/newpromo FISHING100 100 50`\n"
+            "_Создаст промокод FISHING100 на 100 монет, 50 активаций_",
+            parse_mode="Markdown"
+        )
+
+    elif data == "adm_list":
+        promos = list_promos()
+        if not promos:
+            await query.message.reply_text("📋 Промокодов пока нет.")
+            return
+
+        lines = ["📋 *Активные промокоды:*\n"]
+        keyboard = []
+        for p in promos:
+            lines.append(
+                f"🎁 `{p['code']}` — {p['coins']}💰 | осталось активаций: *{p['uses_left']}*"
+            )
+            keyboard.append([InlineKeyboardButton(f"❌ Удалить {p['code']}", callback_data=f"adm_del_{p['code']}")])
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="adm_back")])
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("adm_del_"):
+        code = data.replace("adm_del_", "")
+        delete_promo(code)
+        await query.message.reply_text(f"🗑 Промокод `{code}` удалён.", parse_mode="Markdown")
+
+    elif data == "adm_back":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Создать промокод", callback_data="adm_create")],
+            [InlineKeyboardButton("📋 Список промокодов", callback_data="adm_list")],
+        ])
+        await query.message.reply_text(
+            "🔧 *Панель администратора*",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+
+async def newpromo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    args = ctx.args
+    if len(args) != 3:
+        await update.message.reply_text(
+            "❌ Формат: `/newpromo КОД МОНЕТЫ АКТИВАЦИЙ`\nПример: `/newpromo FISH50 50 10`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        code  = args[0].upper()
+        coins = int(args[1])
+        uses  = int(args[2])
+        if coins <= 0 or uses <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Монеты и активации должны быть положительными числами!")
+        return
+
+    create_promo(code, coins, uses)
+    await update.message.reply_text(
+        f"✅ Промокод создан!\n\n"
+        f"🎁 Код: `{code}`\n"
+        f"💰 Монет: *{coins}*\n"
+        f"🔢 Активаций: *{uses}*",
         parse_mode="Markdown"
     )
 
@@ -263,38 +547,45 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(
         "🎣 *Добро пожаловать на Рыбалку!*\n\n"
-        "Каждый час ты можешь закидывать удочку командой /fish\n"
-        "и ловить рыбу весом от 3 до 20 кг! 🐟🐠🦈\n\n"
-        "👥 Добавь бота в группу — и устроим рыболовный турнир!",
+        "Каждый час закидывай удочку командой /fish\n"
+        "и лови рыбу весом от 3 до 20 кг! 🐟🐠🦈\n\n"
+        "🦹 В группе можно *спиздить* монеты у соседей!\n"
+        "👥 Добавь бота в группу — и устроим турнир!",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
 
-async def fish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def fish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_fish(update.effective_user, update.message.reply_text)
 
-async def profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_profile(update.effective_user, update.message.reply_text)
 
-async def top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def top_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_top(update.message.reply_text)
 
-async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_stats(update.effective_user, update.message.reply_text)
 
-async def shop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def shop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_shop(update.effective_user, update.message.reply_text)
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_help(update.message.reply_text)
 
-# ─── TEXT TRIGGER HANDLER ────────────────────────────────────────────────────
+# ─── TEXT HANDLER ────────────────────────────────────────────────────────────
 
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     text = update.message.text.lower().strip()
     user = update.effective_user
+
+    # Проверяем кражу первой (реплай + триггер)
+    if any(t in text for t in STEAL_TRIGGERS):
+        await do_steal(update, ctx)
+        return
+
     for cmd, triggers in TEXT_TRIGGERS.items():
         if any(t in text for t in triggers):
             if cmd == "fish":       await do_fish(user, update.message.reply_text)
@@ -348,23 +639,57 @@ async def shop_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
+async def set_commands(app):
+    """Устанавливает меню команд для лички и групп"""
+    private_commands = [
+        BotCommand("start",   "🎣 Главное меню"),
+        BotCommand("fish",    "🎣 Закинуть удочку"),
+        BotCommand("profile", "👤 Мой профиль"),
+        BotCommand("top",     "🏆 Топ рыбаков"),
+        BotCommand("stats",   "📊 Статистика улова"),
+        BotCommand("shop",    "🛒 Магазин снаряжения"),
+        BotCommand("promo",   "🎁 Активировать промокод"),
+        BotCommand("help",    "❓ Все команды"),
+        BotCommand("admin",   "🔧 Панель админа"),
+    ]
+    group_commands = [
+        BotCommand("fish",    "🎣 Закинуть удочку"),
+        BotCommand("profile", "👤 Показать профиль"),
+        BotCommand("top",     "🏆 Топ рыбаков"),
+        BotCommand("stats",   "📊 Статистика улова"),
+        BotCommand("shop",    "🛒 Магазин с бонусами"),
+        BotCommand("help",    "💡 Все команды"),
+    ]
+    from telegram.constants import BotCommandScopeType
+    from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+    await app.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+    await app.bot.set_my_commands(group_commands,   scope=BotCommandScopeAllGroupChats())
+
 def main():
-    import os
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise ValueError("BOT_TOKEN не задан!")
+
     init_db()
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("fish",    fish))
-    app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("top",     top))
-    app.add_handler(CommandHandler("stats",   stats))
-    app.add_handler(CommandHandler("shop",    shop))
-    app.add_handler(CommandHandler("help",    help_cmd))
-    app.add_handler(CallbackQueryHandler(shop_callback, pattern="^buy_"))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^cmd_"))
+    app = Application.builder().token(token).post_init(set_commands).build()
+
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("fish",     fish_cmd))
+    app.add_handler(CommandHandler("profile",  profile_cmd))
+    app.add_handler(CommandHandler("top",      top_cmd))
+    app.add_handler(CommandHandler("stats",    stats_cmd))
+    app.add_handler(CommandHandler("shop",     shop_cmd))
+    app.add_handler(CommandHandler("help",     help_cmd))
+    app.add_handler(CommandHandler("promo",    promo_cmd))
+    app.add_handler(CommandHandler("admin",    admin_panel))
+    app.add_handler(CommandHandler("newpromo", newpromo_cmd))
+
+    app.add_handler(CallbackQueryHandler(shop_callback,  pattern="^buy_"))
+    app.add_handler(CallbackQueryHandler(menu_callback,  pattern="^cmd_"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm_"))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
     logger.info("🎣 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
